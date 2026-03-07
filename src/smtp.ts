@@ -2,6 +2,8 @@ import { SMTPServer } from 'smtp-server';
 import { simpleParser } from 'mailparser';
 let ioInstance: any;
 import redisClient from './redis';
+import { db } from './utils/firebaseAdmin';
+import * as admin from 'firebase-admin';
 
 export const inMemoryInbox = new Map<string, any[]>();
 
@@ -36,6 +38,20 @@ const smtpOptions = {
                         // save in memory
                         const currentMessages = inMemoryInbox.get(recipient) || [];
                         inMemoryInbox.set(recipient, [messageData, ...currentMessages]);
+
+                        // save in firebase
+                        if (db) {
+                            try {
+                                const docRef = db.collection('messages').doc(messageData.id);
+                                await docRef.set({
+                                    ...messageData,
+                                    recipient: recipient,
+                                    timestamp: admin.firestore.FieldValue.serverTimestamp()
+                                });
+                            } catch (error) {
+                                console.error("Firebase DB error saving email", error);
+                            }
+                        }
 
                         // cache to redis (for reconnects)
                         if (redisClient.isOpen) {

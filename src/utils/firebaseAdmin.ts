@@ -25,3 +25,4 @@ if (process.env.FIREBASE_PROJECT_ID) {
 }
 
 export const auth = admin.auth ? admin.auth() : null;
+export const db = admin.firestore ? admin.firestore() : null;
