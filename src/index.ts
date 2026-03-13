@@ -11,18 +11,58 @@ import * as admin from 'firebase-admin';
 import redisClient from './redis';
 import adminRoutes from './routes/admin';
 import nodemailer from 'nodemailer';
+import dns from 'dns';
+import { promisify } from 'util';
+import fs from 'fs';
+import path from 'path';
+
+const resolveMx = promisify(dns.resolveMx);
 
 const otpStore = new Map<string, { code: string, expires: number }>();
 
-const transporter = nodemailer.createTransport({
-    sendmail: true,
-    newline: 'unix',
-    path: '/usr/sbin/sendmail'
-});
+// Load DKIM private key
+let dkimPrivateKey = '';
+try {
+    dkimPrivateKey = fs.readFileSync('/etc/dkim/tempworld.key', 'utf8');
+    console.log('DKIM private key loaded successfully');
+} catch (e) {
+    console.warn('DKIM private key not found, emails may not be delivered');
+}
+
+// Send email directly to recipient's MX server with DKIM signing
+async function sendOtpEmail(to: string, subject: string, text: string, html: string) {
+    const domain = to.split('@')[1];
+    const mxRecords = await resolveMx(domain);
+    mxRecords.sort((a, b) => a.priority - b.priority);
+    
+    const transporter = nodemailer.createTransport({
+        host: mxRecords[0].exchange,
+        port: 25,
+        secure: false,
+        name: 'tempworld.org',
+        tls: { rejectUnauthorized: false },
+        connectionTimeout: 10000,
+        greetingTimeout: 10000,
+        dkim: dkimPrivateKey ? {
+            domainName: 'tempworld.org',
+            keySelector: 'mail',
+            privateKey: dkimPrivateKey,
+        } : undefined,
+    });
+
+    await transporter.sendMail({
+        from: '"TempWorld" <noreply@tempworld.org>',
+        to,
+        subject,
+        text,
+        html,
+    });
+}
 
 const WORKER_SECRET = process.env.WORKER_SECRET || 'your-secret-key';
 
 const app = express();
+app.set('trust proxy', 1); // Trust first proxy (Nginx)
 const httpServer = createServer(app);
 export const io = new Server(httpServer, {
     cors: { origin: '*' }
@@ -79,8 +119,9 @@ app.post('/api/incoming-email', async (req: Request, res: Response) => {
         const safeRecipient = (recipient || '').toLowerCase();
         console.log(`📩 Incoming email from Cloudflare Worker for: ${safeRecipient}`);
 
+        const uniqueId = Date.now().toString() + '_' + Math.random().toString(36).substring(2, 8);
         const messageData = {
-            id: Date.now().toString(),
+            id: uniqueId,
             sender: sender || 'Unknown',
             subject: subject || 'No Subject',
             time: new Date(receivedAt || Date.now()).toLocaleTimeString(),
@@ -138,21 +179,18 @@ app.post('/api/auth/send-otp', async (req: Request, res: Response) => {
         // 10 minute expiry
         otpStore.set(email.toLowerCase(), { code, expires: Date.now() + 10 * 60 * 1000 });
 
-        const mailOptions = {
-            from: '"TempWorld Support" <support@tempworld.org>',
-            to: email,
-            subject: 'Your Verification Code',
-            text: `Your verification code is: ${code}\nIt will expire in 10 minutes.`,
-            html: `<h3>Your verification code is: <strong>${code}</strong></h3><p>It will expire in 10 minutes.</p>`
-        };
-
-        transporter.sendMail(mailOptions, (err, info) => {
-            if (err) {
-                console.error("Error sending OTP email:", err);
-                return res.status(500).json({ error: 'Failed to send OTP' });
-            }
-            res.json({ message: 'OTP sent successfully' });
-        });
+        await sendOtpEmail(
+            email,
+            'Your TempWorld Verification Code',
+            `Your verification code is: ${code}\nIt will expire in 10 minutes.`,
+            `<div style="font-family:Arial,sans-serif;max-width:400px;margin:0 auto;padding:20px;background:#0f172a;border-radius:12px;color:#e2e8f0">
+                <h2 style="text-align:center;color:#818cf8">TempWorld</h2>
+                <p style="text-align:center;font-size:14px;color:#94a3b8">Your verification code is:</p>
+                <div style="text-align:center;font-size:32px;font-weight:bold;letter-spacing:8px;color:#ffffff;padding:16px;background:#1e293b;border-radius:8px;margin:16px 0">${code}</div>
+                <p style="text-align:center;font-size:12px;color:#64748b">This code expires in 10 minutes.</p>
+            </div>`
+        );
+        res.json({ message: 'OTP sent successfully' });
     } catch (err) {
         console.error('OTP processing error:', err);
         res.status(500).json({ error: 'Internal server error' });
@@ -195,6 +233,46 @@ app.post('/api/auth/verify-otp', async (req: Request, res: Response) => {
         res.json({ message: 'Email verified successfully' });
     } catch (err) {
         console.error('OTP verification error:', err);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
+// Reset password with OTP verification
+app.post('/api/auth/reset-password-otp', async (req: Request, res: Response) => {
+    try {
+        const { email, code, newPassword } = req.body;
+        if (!email || !code || !newPassword) {
+            return res.status(400).json({ error: 'Email, code, and new password are required' });
+        }
+
+        if (newPassword.length < 6) {
+            return res.status(400).json({ error: 'Password must be at least 6 characters' });
+        }
+
+        const stored = otpStore.get(email);
+        if (!stored) return res.status(400).json({ error: 'No OTP found. Please request a new code.' });
+        if (Date.now() > stored.expires) {
+            otpStore.delete(email);
+            return res.status(400).json({ error: 'OTP expired. Please request a new code.' });
+        }
+        if (stored.code !== code) return res.status(400).json({ error: 'Invalid OTP code' });
+
+        // OTP verified, now reset password
+        otpStore.delete(email);
+
+        if (firebaseAuth) {
+            try {
+                const userRecord = await firebaseAuth.getUserByEmail(email);
+                await firebaseAuth.updateUser(userRecord.uid, { password: newPassword });
+            } catch (fbErr) {
+                console.error('Firebase password reset error:', fbErr);
+                return res.status(500).json({ error: 'Failed to reset password' });
+            }
+        }
+
+        res.json({ message: 'Password reset successfully' });
+    } catch (err) {
+        console.error('Password reset error:', err);
         res.status(500).json({ error: 'Internal server error' });
     }
 });
