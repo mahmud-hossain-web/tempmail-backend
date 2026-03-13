@@ -9,6 +9,16 @@ import { startSMTPServer, inMemoryInbox } from './smtp';
 import { auth as firebaseAuth, db } from './utils/firebaseAdmin';
 import * as admin from 'firebase-admin';
 import redisClient from './redis';
+import adminRoutes from './routes/admin';
+import nodemailer from 'nodemailer';
+
+const otpStore = new Map<string, { code: string, expires: number }>();
+
+const transporter = nodemailer.createTransport({
+    sendmail: true,
+    newline: 'unix',
+    path: '/usr/sbin/sendmail'
+});
 
 const WORKER_SECRET = process.env.WORKER_SECRET || 'your-secret-key';
 
@@ -27,6 +37,9 @@ const apiLimiter = rateLimit({
     max: 100, // 100 requests per 15 minutes
 });
 app.use('/api', apiLimiter);
+
+// Admin dashboard API routes
+app.use('/api/admin', adminRoutes);
 
 // Mock API Key Middleware for Developers
 const developerApiAuth = (req: Request, res: Response, next: any) => {
@@ -116,6 +129,76 @@ app.post('/api/incoming-email', async (req: Request, res: Response) => {
 // Define a secret key. In production, get this from process.env.JWT_SECRET
 const JWT_SECRET = process.env.JWT_SECRET || 'super-secret-tempmail-key-123';
 
+app.post('/api/auth/send-otp', async (req: Request, res: Response) => {
+    try {
+        const { email } = req.body;
+        if (!email) return res.status(400).json({ error: 'Email is required' });
+
+        const code = Math.floor(100000 + Math.random() * 900000).toString();
+        // 10 minute expiry
+        otpStore.set(email.toLowerCase(), { code, expires: Date.now() + 10 * 60 * 1000 });
+
+        const mailOptions = {
+            from: '"TempWorld Support" <support@tempworld.org>',
+            to: email,
+            subject: 'Your Verification Code',
+            text: `Your verification code is: ${code}\nIt will expire in 10 minutes.`,
+            html: `<h3>Your verification code is: <strong>${code}</strong></h3><p>It will expire in 10 minutes.</p>`
+        };
+
+        transporter.sendMail(mailOptions, (err, info) => {
+            if (err) {
+                console.error("Error sending OTP email:", err);
+                return res.status(500).json({ error: 'Failed to send OTP' });
+            }
+            res.json({ message: 'OTP sent successfully' });
+        });
+    } catch (err) {
+        console.error('OTP processing error:', err);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
+app.post('/api/auth/verify-otp', async (req: Request, res: Response) => {
+    try {
+        const { email, code } = req.body;
+        if (!email || !code) return res.status(400).json({ error: 'Email and code are required' });
+
+        const storedOtp = otpStore.get(email.toLowerCase());
+        if (!storedOtp) return res.status(400).json({ error: 'No OTP found for this email. Please resend.' });
+
+        if (Date.now() > storedOtp.expires) {
+            otpStore.delete(email.toLowerCase());
+            return res.status(400).json({ error: 'OTP has expired. Please request a new one.' });
+        }
+
+        if (storedOtp.code !== code) {
+            return res.status(400).json({ error: 'Invalid OTP code' });
+        }
+
+        // Clean up
+        otpStore.delete(email.toLowerCase());
+
+        // Update Firebase User
+        if (firebaseAuth) {
+            try {
+                const userRecord = await firebaseAuth.getUserByEmail(email);
+                if (!userRecord.emailVerified) {
+                    await firebaseAuth.updateUser(userRecord.uid, { emailVerified: true });
+                }
+            } catch (fbErr) {
+                console.error('Firebase update error during OTP verification:', fbErr);
+                // Continue anyway, maybe they don't have a Firebase account yet
+            }
+        }
+
+        res.json({ message: 'Email verified successfully' });
+    } catch (err) {
+        console.error('OTP verification error:', err);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
 app.post('/api/auth/firebase-login', async (req: Request, res: Response) => {
     try {
         const { idToken, name } = req.body;
@@ -202,7 +285,7 @@ app.get('/api/messages/:email', async (req, res) => {
 // Developer API Endpoints
 app.get('/api/developer/domains', developerApiAuth, (req, res) => {
     res.json({
-        domains: ["appschai.site", "appschai.store", "appschai.space"]
+        domains: ["appschai.site", "appschai.store", "appschai.space", "appschai.online", "appschai.website", "appschai.shop", "appschai.fun", "appschai.sbs"]
     });
 });
 
