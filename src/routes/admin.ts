@@ -1,6 +1,6 @@
 import { Router, Request, Response } from 'express';
 import { adminAuthOrDev, AdminRequest } from '../middlewares/adminAuth';
-import { db } from '../utils/firebaseAdmin';
+import { db, admin } from '../utils/firebaseAdmin';
 import redisClient from '../redis';
 import { inMemoryInbox } from '../smtp';
 
@@ -744,8 +744,8 @@ router.get('/payments', async (req: AdminRequest, res: Response) => {
 
         if (db) {
             try {
-                const snapshot = await db.collection('payments')
-                    .orderBy('createdAt', 'desc')
+                const snapshot = await db.collection('paymentRequests')
+                    .orderBy('submittedAt', 'desc')
                     .limit(limitNum)
                     .offset((pageNum - 1) * limitNum)
                     .get();
@@ -753,10 +753,11 @@ router.get('/payments', async (req: AdminRequest, res: Response) => {
                 transactions = snapshot.docs.map(doc => ({
                     id: doc.id,
                     ...doc.data(),
-                    createdAt: doc.data().createdAt?.toDate?.()?.toISOString() || null,
+                    amount: Number(doc.data().amount) || 0,
+                    createdAt: doc.data().submittedAt?.toDate?.()?.toISOString() || null,
                 }));
 
-                const countSnapshot = await db.collection('payments').count().get();
+                const countSnapshot = await db.collection('paymentRequests').count().get();
                 total = countSnapshot.data().count;
 
                 // Calculate MTD revenue
@@ -764,12 +765,12 @@ router.get('/payments', async (req: AdminRequest, res: Response) => {
                 monthStart.setDate(1);
                 monthStart.setHours(0, 0, 0, 0);
 
-                const mtdSnapshot = await db.collection('payments')
-                    .where('createdAt', '>=', monthStart)
-                    .where('status', '==', 'completed')
+                const mtdSnapshot = await db.collection('paymentRequests')
+                    .where('submittedAt', '>=', monthStart)
+                    .where('status', 'in', ['approved', 'completed'])
                     .get();
 
-                revenueMTD = mtdSnapshot.docs.reduce((sum, doc) => sum + (doc.data().amount || 0), 0);
+                revenueMTD = mtdSnapshot.docs.reduce((sum, doc) => sum + (Number(doc.data().amount) || 0), 0);
             } catch (e) {
                 console.error('Firebase payments error:', e);
             }
@@ -787,6 +788,76 @@ router.get('/payments', async (req: AdminRequest, res: Response) => {
         });
     } catch (error) {
         res.status(500).json({ error: 'Failed to fetch payments' });
+    }
+});
+
+router.post('/payments/:id/approve', async (req: AdminRequest, res: Response) => {
+    try {
+        const { id } = req.params;
+        if (!db) return res.status(500).json({ error: 'DB not available' });
+
+        const payRef = db.collection('paymentRequests').doc(id);
+        const paySnap = await payRef.get();
+        if (!paySnap.exists) return res.status(404).json({ error: 'Payment not found' });
+
+        const payment = paySnap.data()!;
+        if (payment.status !== 'pending') return res.status(400).json({ error: 'Payment already processed' });
+
+        const userRef = db.collection('users').doc(payment.userId);
+
+        if (payment.planType === 'created_mail') {
+            // Use merge:true so existing fields are preserved
+            // Only set uid/email if user doc doesn't exist yet (new user)
+            const userSnap = await userRef.get();
+            if (!userSnap.exists) {
+                // Create user doc with correct info from payment
+                await userRef.set({
+                    uid: payment.userId,
+                    email: payment.userEmail || '',
+                    mailCredits: payment.mailCount || 0,
+                    plan: 'free',
+                    createdAt: admin.firestore.FieldValue.serverTimestamp(),
+                });
+                console.log(`[approve] Created user doc for ${payment.userEmail} with ${payment.mailCount} credits`);
+            } else {
+                // Just increment credits — preserve all other fields
+                await userRef.update({
+                    mailCredits: admin.firestore.FieldValue.increment(payment.mailCount || 0),
+                });
+                console.log(`[approve] Incremented ${payment.mailCount} credits for ${payment.userEmail}`);
+            }
+        } else if (payment.planType === 'subscription') {
+            const planDurations: Record<string, number> = { lite: 30, pro: 30, ultra: 30 };
+            const days = planDurations[payment.planKey] || 30;
+            const expiresAt = new Date(Date.now() + days * 24 * 60 * 60 * 1000);
+            await userRef.set({
+                plan: payment.planKey,
+                subscriptionExpiresAt: expiresAt,
+            }, { merge: true });
+        }
+
+
+        await payRef.update({ status: 'approved', reviewedAt: admin.firestore.FieldValue.serverTimestamp() });
+
+        res.json({ success: true, message: 'Payment approved' });
+    } catch (error) {
+        console.error('Payment approve error:', error);
+        res.status(500).json({ error: 'Failed to approve payment' });
+    }
+});
+
+router.post('/payments/:id/reject', async (req: AdminRequest, res: Response) => {
+    try {
+        const { id } = req.params;
+        if (!db) return res.status(500).json({ error: 'DB not available' });
+
+        const payRef = db.collection('paymentRequests').doc(id);
+        await payRef.update({ status: 'rejected', reviewedAt: admin.firestore.FieldValue.serverTimestamp() });
+
+        res.json({ success: true, message: 'Payment rejected' });
+    } catch (error) {
+        console.error('Payment reject error:', error);
+        res.status(500).json({ error: 'Failed to reject payment' });
     }
 });
 

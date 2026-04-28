@@ -22,12 +22,13 @@ const smtpOptions = {
                         recipient = (recipient || '').toLowerCase();
                         console.log(`New mail received for target address: ${recipient}`);
 
+                        const uniqueId = Date.now().toString() + '_' + Math.random().toString(36).substring(2, 8);
                         const messageData = {
-                            id: Date.now().toString(),
+                            id: uniqueId,
                             sender: parsed.from?.text || 'Unknown',
                             subject: parsed.subject || 'No Subject',
                             time: new Date().toLocaleTimeString(),
-                            body: parsed.text || parsed.html || '',
+                            body: parsed.html || parsed.text || '',
                         };
 
                         // emit realtime
